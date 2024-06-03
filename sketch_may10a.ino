@@ -1,5 +1,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
 // WiFi setting
 const char* ssid = "OV-65";
@@ -11,15 +13,29 @@ IPAddress gateway(192,168,2,1);
 IPAddress subnet(255,255,255,0);
 WebServer server(80);
 
-const int powerPin = 25;
-const int switchPin = 26;
-const int ignitorPin = 27;
-const int valvePin = 28;
+const int powerPin = 18;
+const int switchPin = 19;
+const int ignitorPin = 21;
+const int valvePin = 22;
+const int tempPin = 15;
 
 const int ignitorDelay = 30 * 1000; // msec
 const int stabilizationDelay = 30 * 1000; // msec
 
-bool heaterIsTurnOn = 0;
+OneWire oneWire(tempPin);
+DallasTemperature sensors(&oneWire);
+
+DeviceAddress exhaustSensor = {0x28, 0x44, 0xC7, 0x46, 0xD4, 0x9C, 0x3C, 0x39};
+DeviceAddress blowSensor = {0x28, 0xE1, 0x7D, 0x46, 0xD4, 0x5D, 0x7F, 0xA8};
+DeviceAddress garageTempSensor = {0x28, 0xC7, 0xFB, 0x46, 0xD4, 0x6A, 0x19, 0x00};
+
+
+// 0 = off 
+// 1 = start
+// 2 = on
+// 3 = stop
+// 4 = fail
+int state = 0;
 
 class Heater;
 Heater *ov65;
@@ -62,12 +78,6 @@ class Heater {
   Motor *motor;
   Relay *ignitor;
   Relay *valve;
-  // 0 = off 
-  // 1 = start
-  // 2 = on
-  // 3 = stop
-  // 4 = fail
-  int state;
 
   public:
   Heater(Relay *_power, Motor *_motor, Relay *_ignitor, Relay *_valve){
@@ -76,58 +86,60 @@ class Heater {
     ignitor = _ignitor;
     valve = _valve;
 
-    state = 0;
-    
     power->turnOff();
     ignitor->turnOff();
     valve->turnOff();
   }
-
-  int getState(){
-    return state;
-  }
   
   void run(){
-    state = 2;
+    state = 1;
     power->turnOn();
     valve->turnOn();
     motor->HighSpeed();
-    // delay(ignitorDelay);
-    delay(5000);
+
+    Serial2.println("before delay");
+    delay(ignitorDelay);
+    Serial2.println("after delay");
 
     ignitor->turnOn();
     digitalWrite(2, HIGH);
 
-    // delay(stabilizationDelay);
+    delay(stabilizationDelay);
 
     ignitor->turnOff();
     digitalWrite(2, LOW);
+    Serial2.println("before change state");
     state = 2;
+    Serial2.println("after change state");
+
+    return;
   }
 
   static void runImpl(void* _this){
     ((Heater*)_this)->run();
+    vTaskDelete(NULL);
   }
 
   void heaterRun(){
-    xTaskCreatePinnedToCore(this->runImpl, "ov65-run", 10000, this, 0, NULL, 1);
+    xTaskCreatePinnedToCore(this->runImpl, "ov65-run", 10000, this, 0, NULL, 0);
   }
 
   void stop(){
     state = 3;
     valve->turnOff();
     // 5 minutes
-    // delay(5 * 60 * 1000);
+    delay(5  * 1000);
     power->turnOff();
-    state = 4;
+    state = 0;
   }
 
   static void stopImpl(void* _this){
     ((Heater*)_this)->stop();
+    vTaskDelete(NULL);
   }
 
   void heaterStop(){
-    xTaskCreatePinnedToCore(this->stopImpl, "ov65-stop", 10000, this, 0, NULL, 1);
+    xTaskCreatePinnedToCore(this->stopImpl, "ov65-stop", 10000, this, 0, NULL, 0);
   }
 };
 
@@ -165,7 +177,7 @@ String SendHTML(){
   ptr +="</head>\n";
   ptr +="<body>\n";
   ptr +="<h1>ОВ-65 дистанционное управление</h1>\n";
-  switch (ov65->getState()){
+  switch (state){
     case 0:
     {
       ptr +="<p>Состояние Отопителя: ВЫКЛЮЧЕН.</p><a class=\"button button-on\" href=\"/heaterTunrOn\">ВКЛ.</a>\n";
@@ -187,6 +199,10 @@ String SendHTML(){
       break;
     }
   }
+  sensors.requestTemperatures();
+  ptr +="<h1>Температура выхлопных газов: " + String(sensors.getTempC(exhaustSensor)) + "°C</h1>\n";
+  ptr +="<h1>Температура выходного воздуха: " + String(sensors.getTempC(blowSensor)) + "°C</h1>\n";
+  ptr +="<h1>Температура в гараже: " + String(sensors.getTempC(garageTempSensor)) + "°C</h1>\n";
   ptr += "<meta http-equiv=\"refresh\" content=\"1; URL=/\">\n";
   ptr +="</body>\n";
   ptr +="</html>\n";
@@ -197,8 +213,6 @@ void setup() {
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
-  // put your setup code here, to run once:
   pinMode(2, OUTPUT);
 
   Relay *power = new Relay(powerPin);
@@ -216,6 +230,7 @@ void loop() {
   server.on("/heaterTunrOn", handle_heaterTunrOn);
   server.onNotFound(handle_NotFound);
   server.begin();
+  sensors.begin();
 
   while(true){
     server.handleClient();
